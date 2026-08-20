@@ -32,7 +32,7 @@ namespace FieldDeskCollector;
 /// </summary>
 public static class Collector
 {
-    private const string Version = "1.3.0";
+    private const string Version = "1.4.0";
 
     private const long Days30 = 2_592_000_000L;
     private const long Days90 = 7_776_000_000L;
@@ -791,6 +791,315 @@ public static class Collector
             Note("Only this host's own adapter configuration is read. No other hosts are contacted or scanned.");
         });
 
+        // ==================== BATCH 1B: SERVICES ====================
+        Section("Services (non-Microsoft and risky configurations)");
+        Module("Services", "CIM Win32_Service", () =>
+        {
+            var svcs = Query("SELECT * FROM Win32_Service").ToList();
+            KV("Total services", svcs.Count);
+            int localSystem = 0, nonMs = 0, unquoted = 0, outside = 0;
+            var risky = new List<string>();
+            var thirdParty = new List<string>();
+
+            foreach (var s in svcs)
+            {
+                string name = s["Name"]?.ToString() ?? "";
+                string disp = s["DisplayName"]?.ToString() ?? "";
+                string state = s["State"]?.ToString() ?? "";
+                string startMode = s["StartMode"]?.ToString() ?? "";
+                string account = s["StartName"]?.ToString() ?? "";
+                string pathName = s["PathName"]?.ToString() ?? "";
+
+                bool isSystemAcct = account.Equals("LocalSystem", StringComparison.OrdinalIgnoreCase);
+                if (isSystemAcct) localSystem++;
+
+                string exe = ExtractExePath(pathName);
+                bool msLoc = IsStandardExeLocation(exe);
+                if (!msLoc && exe.Length > 0)
+                {
+                    outside++;
+                    nonMs++;
+                    thirdParty.Add($"  - {disp} [{name}]  State: {state}; Start: {startMode}; Account: {account}");
+                    thirdParty.Add($"      Path: {exe}");
+                }
+
+                bool unq = HasUnquotedServicePath(pathName);
+                if (unq)
+                {
+                    unquoted++;
+                    risky.Add($"  - UNQUOTED PATH: {disp} [{name}]  ->  {pathName}");
+                    Flag("4.6", "Unquoted service path", "Concern", $"Service '{name}' has an unquoted path with spaces; a privilege-escalation risk.");
+                }
+                if (!msLoc && exe.Length > 0 && isSystemAcct && startMode.Equals("Auto", StringComparison.OrdinalIgnoreCase))
+                    risky.Add($"  - AUTO + LocalSystem + non-standard path: {disp} [{name}]  ->  {exe}");
+            }
+
+            KV("Services running as LocalSystem", localSystem);
+            KV("Services with executables outside standard locations", outside);
+            KV("Unquoted service paths", unquoted);
+
+            if (risky.Count > 0)
+            {
+                Line("");
+                Line("Risky service configurations:");
+                foreach (var r in risky.Take(60)) Line(r);
+            }
+            if (thirdParty.Count > 0)
+            {
+                Line("");
+                Line("Non-standard-location services (first 40):");
+                foreach (var t in thirdParty.Take(80)) Line(t);
+            }
+            Note("Not every LocalSystem service is a problem; Windows runs many core services that way. The flagged items are the combinations worth a look.");
+        });
+
+        // ==================== BATCH 1C: DEFENDER ADVANCED + SECURITY FEATURES ====================
+        Section("Defender advanced settings");
+        Module("Defender advanced", "CIM MSFT_MpPreference/MpComputerStatus", () =>
+        {
+            var pref = QueryFirst("SELECT * FROM MSFT_MpPreference", @"root\Microsoft\Windows\Defender");
+            var stat = QueryFirst("SELECT * FROM MSFT_MpComputerStatus", @"root\Microsoft\Windows\Defender");
+            if (stat != null)
+            {
+                KV("Cloud-delivered protection (MAPS)", MapsText(pref?["MAPSReporting"]));
+                KV("Automatic sample submission", SampleText(pref?["SubmitSamplesConsent"]));
+                KV("PUA protection", PuaText(pref?["PUAProtection"]));
+                KV("Antimalware engine version", stat["AMEngineVersion"]);
+                KV("Antimalware platform version", stat["AMServiceVersion"]);
+            }
+            if (pref != null)
+            {
+                KV("Network protection", NpText(pref["EnableNetworkProtection"]));
+                KV("Controlled Folder Access", CfaText(pref["EnableControlledFolderAccess"]));
+                if (ToInt(pref["EnableNetworkProtection"]) == 0)
+                    Flag("10.1", "Network protection", "Info", "Defender network protection is off.");
+                if (ToInt(pref["EnableControlledFolderAccess"]) == 0)
+                    Flag("10.1", "Controlled Folder Access", "Info", "Controlled Folder Access (ransomware guard) is off.");
+            }
+            else Note("Defender preference class unavailable.");
+        });
+
+        Section("Attack Surface Reduction (ASR) rules");
+        Module("ASR rules", "CIM MSFT_MpPreference", () =>
+        {
+            var pref = QueryFirst("SELECT * FROM MSFT_MpPreference", @"root\Microsoft\Windows\Defender");
+            var ids = ToStringArray(pref?["AttackSurfaceReductionRules_Ids"]);
+            var acts = ToStringArray(pref?["AttackSurfaceReductionRules_Actions"]);
+            if (ids.Length == 0)
+            {
+                Note("No ASR rules are configured.");
+                Flag("10.1", "ASR rules", "Info", "No Attack Surface Reduction rules are configured.");
+                return;
+            }
+            for (int i = 0; i < ids.Length; i++)
+            {
+                string id = ids[i];
+                string act = (acts != null && i < acts.Length) ? AsrActionText(acts[i]) : "Unknown";
+                Line($"  - {AsrRuleName(id)}  [{id}]  =>  {act}");
+            }
+        });
+
+        Section("Windows security features");
+        Module("Device Guard (VBS/HVCI/Credential Guard)", "CIM Win32_DeviceGuard", () =>
+        {
+            var dg = QueryFirst("SELECT * FROM Win32_DeviceGuard", @"root\Microsoft\Windows\DeviceGuard");
+            if (dg != null)
+            {
+                var running = ToIntArray(dg["SecurityServicesRunning"]);
+                var configured = ToIntArray(dg["SecurityServicesConfigured"]);
+                int vbs = ToInt(dg["VirtualizationBasedSecurityStatus"]);
+                KV("VBS status", VbsText(vbs));
+                bool credGuard = running.Contains(1);
+                bool hvci = running.Contains(2);
+                KV("Credential Guard running", credGuard);
+                KV("HVCI / Memory Integrity running", hvci);
+                KV("Configured services", string.Join(", ", configured.Select(SecSvcText)));
+                if (!credGuard) Flag("5.4", "Credential Guard", "Info", "Credential Guard is not running.");
+                if (!hvci) Flag("4.1", "Memory Integrity (HVCI)", "Info", "HVCI / Memory Integrity is not running.");
+            }
+            else Note("Device Guard WMI class unavailable on this edition.");
+        });
+
+        Module("LSA protection", "Registry", () =>
+        {
+            object? runAsPPL = ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "RunAsPPL");
+            KV("LSA protection (RunAsPPL)", runAsPPL == null ? "Not set" : (ToInt(runAsPPL) >= 1).ToString());
+            if (runAsPPL == null || ToInt(runAsPPL) == 0)
+                Flag("5.4", "LSA protection", "Info", "LSA protection (RunAsPPL) is not enabled.");
+        });
+
+        // ==================== BATCH 1D: FIRMWARE + POWERSHELL + WINRM ====================
+        Section("Firmware / BIOS");
+        Module("Firmware", "CIM Win32_BIOS + registry", () =>
+        {
+            var bios = QueryFirst("SELECT * FROM Win32_BIOS");
+            if (bios != null)
+            {
+                KV("BIOS vendor", bios["Manufacturer"]);
+                KV("BIOS version", bios["SMBIOSBIOSVersion"]);
+                KV("BIOS release date", ToDate(bios["ReleaseDate"]));
+            }
+            object? mode = ReadReg(@"SYSTEM\CurrentControlSet\Control", "PEFirmwareType");
+            KV("Firmware type", mode == null ? "Unknown" : (ToInt(mode) == 2 ? "UEFI" : ToInt(mode) == 1 ? "Legacy BIOS" : "Unknown"));
+        });
+
+        Section("PowerShell security");
+        Module("PowerShell", "Registry + version", () =>
+        {
+            object? psv = ReadRegHive(Registry.LocalMachine, @"SOFTWARE\Microsoft\PowerShell\3\PowerShellEngine", "PowerShellVersion");
+            KV("Windows PowerShell version", psv ?? "Unknown");
+            KV("PowerShell 7 present", RegKeyExists(@"SOFTWARE\Microsoft\PowerShellCore\InstalledVersions"));
+            object? sbl = ReadReg(@"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging", "EnableScriptBlockLogging");
+            object? ml = ReadReg(@"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging", "EnableModuleLogging");
+            object? tr = ReadReg(@"SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription", "EnableTranscripting");
+            KV("Script Block Logging", sbl == null ? "Not set" : (ToInt(sbl) == 1).ToString());
+            KV("Module Logging", ml == null ? "Not set" : (ToInt(ml) == 1).ToString());
+            KV("Transcription", tr == null ? "Not set" : (ToInt(tr) == 1).ToString());
+            if (sbl == null || ToInt(sbl) == 0)
+                Flag("8.2", "PowerShell logging", "Info", "PowerShell Script Block Logging is not enabled.");
+        });
+
+        Section("WinRM / PowerShell remoting");
+        Module("WinRM", "CIM Win32_Service + netsh", () =>
+        {
+            var winrm = QueryFirst("SELECT * FROM Win32_Service WHERE Name='WinRM'");
+            if (winrm != null)
+                KV("WinRM service", $"State: {winrm["State"]}; StartMode: {winrm["StartMode"]}");
+            else KV("WinRM service", "Not found");
+            string listeners = RunProc("netsh.exe", "http show servicestate view=session");
+            bool has5985 = listeners.Contains(":5985", StringComparison.OrdinalIgnoreCase);
+            bool has5986 = listeners.Contains(":5986", StringComparison.OrdinalIgnoreCase);
+            KV("WinRM HTTP listener (5985) seen", has5985);
+            KV("WinRM HTTPS listener (5986) seen", has5986);
+        });
+
+        // ==================== BATCH 1E: SOFTWARE CLASSIFICATION + MANAGEMENT ====================
+        Section("Software classification");
+        Module("Software classification", "Derived from inventory", () =>
+        {
+            if (allApps.Count == 0) { Note("No inventory available to classify."); return; }
+            var cats = new (string Label, string[] Keys)[]
+            {
+                ("Remote access", new[] { "TeamViewer", "AnyDesk", "RemotePC", "LogMeIn", "GoTo", "VNC", "Chrome Remote", "Splashtop", "ScreenConnect", "DWService" }),
+                ("RMM", new[] { "NinjaRMM", "Datto", "ConnectWise", "Atera", "Kaseya", "N-able", "Syncro", "Action1" }),
+                ("VPN", new[] { "OpenVPN", "WireGuard", "NordVPN", "ExpressVPN", "Cisco AnyConnect", "FortiClient", "GlobalProtect", "Pulse Secure" }),
+                ("File sync", new[] { "Dropbox", "Google Drive", "OneDrive", "Box", "Nextcloud", "Sync.com", "pCloud" }),
+                ("Password manager", new[] { "LastPass", "1Password", "Bitwarden", "KeePass", "Dashlane", "Keeper" }),
+                ("Packet capture", new[] { "Wireshark", "Npcap", "WinPcap", "Fiddler", "tcpdump" }),
+                ("Network scanner", new[] { "Nmap", "Angry IP", "Advanced IP Scanner", "SoftPerfect" }),
+                ("Admin tool", new[] { "PsExec", "Sysinternals", "PuTTY", "WinSCP", "Bitvise", "Process Hacker" }),
+                ("End-of-life", new[] { "Java 8", "Java 7", "Python 2", ".NET Framework 3", "Adobe Flash", "Internet Explorer" })
+            };
+            foreach (var (label, keys) in cats)
+            {
+                var hits = allApps.Keys.Where(n => keys.Any(k => n.Contains(k, StringComparison.OrdinalIgnoreCase))).ToList();
+                if (hits.Count == 0) continue;
+                Line($"**{label}:**");
+                foreach (var h in hits) Line($"  - {h}");
+            }
+        });
+
+        Section("Endpoint management detection");
+        Module("Endpoint management", "Registry + services + dsregcmd", () =>
+        {
+            bool intune = RegKeyExists(@"SOFTWARE\Microsoft\Enrollments") &&
+                          RunProc("dsregcmd.exe", "/status").Contains("MDMUrl", StringComparison.OrdinalIgnoreCase);
+            bool sccm = QueryFirst("SELECT * FROM Win32_Service WHERE Name='CcmExec'") != null;
+            bool intuneAgent = QueryFirst("SELECT * FROM Win32_Service WHERE Name='IntuneManagementExtension'") != null;
+            string[] rmmSvc = { "NinjaRMMAgent", "AteraAgent", "CagService", "Kaseya", "Syncro", "screenconnect", "ltservice", "amp_mgr" };
+            bool rmm = false;
+            foreach (var s in Query("SELECT * FROM Win32_Service"))
+            {
+                string nm = s["Name"]?.ToString() ?? "";
+                if (rmmSvc.Any(r => nm.Contains(r, StringComparison.OrdinalIgnoreCase))) { rmm = true; break; }
+            }
+            string dsreg = RunProc("dsregcmd.exe", "/status");
+            bool aadJoined = dsreg.Contains("AzureAdJoined : YES", StringComparison.OrdinalIgnoreCase);
+            bool domainJoined = dsreg.Contains("DomainJoined : YES", StringComparison.OrdinalIgnoreCase);
+
+            KV("Intune / MDM enrolled", intune || intuneAgent);
+            KV("SCCM / MECM client", sccm);
+            KV("RMM agent detected", rmm);
+            KV("Entra (Azure AD) joined", aadJoined);
+            KV("Domain joined", domainJoined);
+            bool managed = intune || intuneAgent || sccm || rmm || domainJoined || aadJoined;
+            KV("Overall management", managed ? "Detected" : "None detected");
+            Note("Presence is evidence of management, not proof the agent is healthy or checking in.");
+            if (!managed)
+                Flag("5.1", "Endpoint management", "Concern", "No management plane detected; the machine is unmanaged.");
+        });
+
+        // ==================== TIER 2: POLICY + RECOVERY + NETWORK DETAIL ====================
+        Section("Backup and recovery posture");
+        Module("Recovery posture", "reg + vssadmin + services", () =>
+        {
+            string sr = RunProc("reg.exe", @"query ""HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"" /v RPSessionInterval");
+            KV("System Restore configured", sr.Contains("RPSessionInterval", StringComparison.OrdinalIgnoreCase));
+            string wre = RunProc("reagentc.exe", "/info");
+            bool wreEnabled = wre.Contains("Enabled", StringComparison.OrdinalIgnoreCase);
+            KV("Windows Recovery Environment (WinRE)", wreEnabled ? "Enabled" : "Disabled/unknown");
+            string[] backupSvc = { "Veeam", "Acronis", "Carbonite", "Datto", "Backblaze", "CrashPlan", "Cove", "MacriumService", "wbengine" };
+            var found = new List<string>();
+            foreach (var s in Query("SELECT * FROM Win32_Service"))
+            {
+                string nm = s["Name"]?.ToString() ?? "";
+                string dp = s["DisplayName"]?.ToString() ?? "";
+                if (backupSvc.Any(b => nm.Contains(b, StringComparison.OrdinalIgnoreCase) || dp.Contains(b, StringComparison.OrdinalIgnoreCase)))
+                    found.Add($"  - {dp} [{nm}]  State: {s["State"]}");
+            }
+            if (found.Count > 0) { Line("Backup agents detected:"); foreach (var f in found) Line(f); }
+            else { Note("No third-party backup agent detected."); Flag("11.2", "Backup agent", "Concern", "No backup software detected on this machine."); }
+        }, requiresAdmin: true);
+
+        Section("SMB and NTLM configuration");
+        Module("SMB/NTLM", "Registry", () =>
+        {
+            object? reqSign = ReadReg(@"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", "RequireSecuritySignature");
+            KV("SMB server signing required", reqSign == null ? "Not set" : (ToInt(reqSign) == 1).ToString());
+            object? cliSign = ReadReg(@"SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters", "RequireSecuritySignature");
+            KV("SMB client signing required", cliSign == null ? "Not set" : (ToInt(cliSign) == 1).ToString());
+            object? ntlm = ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0", "NtlmMinClientSec");
+            KV("NTLM min client security", ntlm ?? "Not set");
+        });
+
+        Section("Proxy configuration");
+        Module("Proxy", "Registry", () =>
+        {
+            object? enable = ReadRegHive(Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\Internet Settings", "ProxyEnable");
+            object? server = ReadRegHive(Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\Internet Settings", "ProxyServer");
+            KV("Proxy enabled (current user)", enable == null ? "Not set" : (ToInt(enable) == 1).ToString());
+            KV("Proxy server", server ?? "None");
+        });
+
+        Section("Credential Manager (presence only)");
+        Module("Credential Manager", "cmdkey list (counts only)", () =>
+        {
+            // COUNT ONLY. Never the secret contents. This module deliberately
+            // parses only the number of stored targets, not their values.
+            string ck = RunProc("cmdkey.exe", "/list");
+            int stored = Regex.Matches(ck, @"Target:", RegexOptions.IgnoreCase).Count;
+            KV("Stored credential entries (count only)", stored);
+            Note("Only the number of stored entries is read. Their secret contents are never collected.");
+        });
+
+        Section("Effective policy summary");
+        Module("Effective policy (gpresult)", "gpresult", () =>
+        {
+            string gp = RunProc("gpresult.exe", "/r /scope:computer");
+            bool any = false;
+            foreach (var raw in gp.Split('\n'))
+            {
+                var t = raw.Trim();
+                if (t.StartsWith("Applied Group Policy Objects", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("The computer is a part of", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("Domain Name", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("Domain Type", StringComparison.OrdinalIgnoreCase))
+                { Line("  " + t); any = true; }
+            }
+            if (gp.Contains("N/A", StringComparison.OrdinalIgnoreCase) || !any)
+                Note("No applied domain Group Policy objects (standalone/workgroup machine).");
+        }, requiresAdmin: true);
+
         // ==================== COLLECTION PROVENANCE ====================
         Section("Collection provenance");
         Line("| Module | Source | Status | ms | Reason |");
@@ -1098,4 +1407,91 @@ public static class Collector
     };
 
     private static string Sanitize(string s) => Regex.Replace(s, "[^A-Za-z0-9_-]", "_");
+
+    // ---- Batch 1B: services helpers ----
+    private static string ExtractExePath(string pathName)
+    {
+        if (string.IsNullOrWhiteSpace(pathName)) return "";
+        pathName = pathName.Trim();
+        if (pathName.StartsWith("\""))
+        {
+            int end = pathName.IndexOf('"', 1);
+            if (end > 1) return pathName.Substring(1, end - 1);
+        }
+        var m = Regex.Match(pathName, @"^(.*?\.exe)", RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups[1].Value : pathName;
+    }
+
+    private static bool IsStandardExeLocation(string exe)
+    {
+        if (string.IsNullOrWhiteSpace(exe)) return true; // don't flag unknown
+        string e = exe.ToLowerInvariant();
+        return e.Contains(@"\windows\") || e.Contains(@"\program files\") || e.Contains(@"\program files (x86)\");
+    }
+
+    private static bool HasUnquotedServicePath(string pathName)
+    {
+        if (string.IsNullOrWhiteSpace(pathName)) return false;
+        string p = pathName.Trim();
+        if (p.StartsWith("\"")) return false;                 // properly quoted
+        var exe = Regex.Match(p, @"^(.*?\.exe)", RegexOptions.IgnoreCase);
+        if (!exe.Success) return false;
+        string exePath = exe.Groups[1].Value;
+        return exePath.Contains(' ');                          // space + unquoted = risk
+    }
+
+    // ---- Batch 1C: Defender / ASR / Device Guard text maps ----
+    private static string MapsText(object? v) => ToInt(v) switch { 0 => "Disabled", 1 => "Basic", 2 => "Advanced", _ => "Not set" };
+    private static string SampleText(object? v) => ToInt(v) switch { 0 => "Always prompt", 1 => "Send safe samples", 2 => "Never send", 3 => "Send all samples", _ => "Not set" };
+    private static string PuaText(object? v) => ToInt(v) switch { 0 => "Disabled", 1 => "Enabled", 2 => "Audit", _ => "Not set" };
+    private static string NpText(object? v) => ToInt(v) switch { 0 => "Disabled", 1 => "Enabled (block)", 2 => "Audit", _ => "Not set" };
+    private static string CfaText(object? v) => ToInt(v) switch { 0 => "Disabled", 1 => "Enabled (block)", 2 => "Audit", _ => "Not set" };
+    private static string AsrActionText(string a) => a switch { "0" => "Not configured", "1" => "Enabled (block)", "2" => "Audit", "6" => "Warn", _ => "Unknown" };
+    private static string VbsText(int v) => v switch { 0 => "Off", 1 => "Enabled but not running", 2 => "Enabled and running", _ => "Unknown" };
+    private static string SecSvcText(int v) => v switch { 1 => "Credential Guard", 2 => "HVCI", 3 => "System Guard", 4 => "SMM", _ => $"Service {v}" };
+
+    private static int[] ToIntArray(object? o)
+    {
+        if (o is int[] ia) return ia;
+        if (o is System.Collections.IEnumerable en && o is not string)
+        {
+            var list = new List<int>();
+            foreach (var item in en) if (int.TryParse(item?.ToString(), out int n)) list.Add(n);
+            return list.ToArray();
+        }
+        return Array.Empty<int>();
+    }
+
+    private static string[] ToStringArray(object? o)
+    {
+        if (o is string[] sa) return sa;
+        if (o is System.Collections.IEnumerable en && o is not string)
+        {
+            var list = new List<string>();
+            foreach (var item in en) { var v = item?.ToString(); if (!string.IsNullOrEmpty(v)) list.Add(v); }
+            return list.ToArray();
+        }
+        return Array.Empty<string>();
+    }
+
+    private static string AsrRuleName(string guid) => guid.ToLowerInvariant() switch
+    {
+        "56a863a9-875e-4185-98a7-b882c64b5ce5" => "Block abuse of exploited vulnerable signed drivers",
+        "7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c" => "Block Adobe Reader from creating child processes",
+        "d4f940ab-401b-4efc-aadc-ad5f3c50688a" => "Block Office apps from creating child processes",
+        "9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2" => "Block credential stealing from LSASS",
+        "be9ba2d9-53ea-4cdc-84e5-9b1eeee46550" => "Block executable content from email/webmail",
+        "01443614-cd74-433a-b99e-2ecdc07bfc25" => "Block executables unless prevalence/age/trusted",
+        "5beb7efe-fd9a-4556-801d-275e5ffc04cc" => "Block execution of potentially obfuscated scripts",
+        "d3e037e1-3eb8-44c8-a917-57927947596d" => "Block JS/VBScript from launching downloaded content",
+        "3b576869-a4ec-4529-8536-b80a7769e899" => "Block Office apps from creating executable content",
+        "75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84" => "Block Office apps from injecting into other processes",
+        "26190899-1602-49e8-8b27-eb1d0a1ce869" => "Block Office comm apps from creating child processes",
+        "e6db77e5-3df2-4cf1-b95a-636979351e5b" => "Block persistence through WMI event subscription",
+        "d1e49aac-8f56-4280-b9ba-993a6d77406c" => "Block process creations from PsExec and WMI",
+        "b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4" => "Block untrusted/unsigned processes from USB",
+        "92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b" => "Block Win32 API calls from Office macros",
+        "c1db55ab-c21a-4637-bb3f-a12568109d35" => "Use advanced ransomware protection",
+        _ => "ASR rule"
+    };
 }
