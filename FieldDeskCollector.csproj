@@ -9,7 +9,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyTitle>FieldDesk Collector</AssemblyTitle>
     <Product>FieldDesk Collector</Product>
-    <Version>1.1.0</Version>
+    <Version>1.3.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- Single-file publish settings are passed on the command line / in CI,
          but these defaults help local builds too. -->
