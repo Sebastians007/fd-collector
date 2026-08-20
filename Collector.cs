@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
 using System.Linq;
 using System.Management;
@@ -14,54 +15,110 @@ namespace FieldDeskCollector;
 /// <summary>
 /// Reads read-only security posture from THIS computer only and returns the
 /// path to a Markdown report. Touches no other machine. Changes nothing.
-/// Never writes a BitLocker recovery key into the report.
+///
+/// HARD DENYLIST — this tool NEVER reads any of the following. This boundary
+/// is enforced by simply never issuing a query for them, and is surfaced in
+/// the report so a client can see it:
+///   - Passwords or password hashes
+///   - LSA secrets
+///   - Cached domain credentials
+///   - Browser passwords, cookies, autofill, or history
+///   - Authentication or session tokens
+///   - Private keys
+///   - BitLocker recovery-key values (presence only)
+///   - Credential Manager secret contents
+/// Event logs are read for COUNTS and DATES only, never message bodies,
+/// command lines, or file contents.
 /// </summary>
 public static class Collector
 {
-    private const string Version = "1.1.0";
+    private const string Version = "1.3.0";
 
-    // Recovery-key shape: 8 groups of 6 digits. Used only to REDACT, never to emit.
+    private const long Days30 = 2_592_000_000L;
+    private const long Days90 = 7_776_000_000L;
+    private const long Days365 = 31_536_000_000L;
+
+    // Single source of truth for the denylist, shown in the report.
+    private static readonly string[] NeverCollect =
+    {
+        "Passwords or password hashes",
+        "LSA secrets",
+        "Cached domain credentials",
+        "Browser passwords, cookies, autofill, or history",
+        "Authentication or session tokens",
+        "Private keys",
+        "BitLocker recovery-key values (presence only)",
+        "Credential Manager secret contents",
+        "Event-log message bodies, command lines, or file contents"
+    };
+
     private static readonly Regex RecoveryKeyPattern =
         new(@"\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}", RegexOptions.Compiled);
 
+    private sealed class Finding
+    {
+        public string Cis = "", Item = "", Status = "", Detail = "";
+    }
+
+    private sealed class Prov
+    {
+        public string Name = "", Source = "", Status = "", Reason = "";
+        public long Ms;
+    }
+
     public static string Run(Action<string> log)
     {
-        var sb = new StringBuilder();
+        var body = new StringBuilder();
+        var findings = new List<Finding>();
+        var prov = new List<Prov>();
         var start = DateTime.Now;
 
-        void Line(string s) => sb.AppendLine(s);
-        void KV(string k, object? v) => sb.AppendLine($"- **{k}:** {v}");
-        void Section(string t) { sb.AppendLine(); sb.AppendLine($"## {t}"); sb.AppendLine(); }
-        void Note(string s) => sb.AppendLine($"> {s}");
+        void Line(string s) => body.AppendLine(s);
+        void KV(string k, object? v) => body.AppendLine($"- **{k}:** {v}");
+        void Section(string t) { body.AppendLine(); body.AppendLine($"## {t}"); body.AppendLine(); }
+        void Note(string s) => body.AppendLine($"> {s}");
+        void Flag(string cis, string item, string status, string detail)
+            => findings.Add(new Finding { Cis = cis, Item = item, Status = status, Detail = detail });
 
         bool isAdmin = IsAdmin();
         string host = Environment.MachineName;
 
-        // Reused across sections.
+        // Shared across modules — declared here so each module can read them.
         var adminMembers = new List<string>();
         string loggedInUser = "";
+        bool isHomeEdition = false;
+        var allApps = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        // ---------------- HEADER ----------------
-        Line("# FieldDesk Collection Report");
-        Line("");
-        KV("Hostname", host);
-        KV("Collected (local)", start.ToString("yyyy-MM-dd HH:mm:ss zzz"));
-        KV("Collected (UTC)", start.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss"));
-        KV("Collector version", Version);
-        KV("Run as", Environment.UserName);
-        KV("Elevated (admin)", isAdmin);
-        Line("");
-        Note("This report describes only this one computer. Read-only. Nothing was changed or installed.");
-        log("Header written.");
+        // Module wrapper: times the work, records provenance, and turns an
+        // access failure into "Failed: reason" instead of a silent blank.
+        void Module(string name, string source, Action work, bool requiresAdmin = false)
+        {
+            if (requiresAdmin && !isAdmin)
+            {
+                prov.Add(new Prov { Name = name, Source = source, Status = "Skipped", Reason = "Not elevated" });
+                return;
+            }
+            var sw = Stopwatch.StartNew();
+            string status = "Success", reason = "";
+            try { work(); }
+            catch (Exception ex) { status = "Failed"; reason = ex.Message; }
+            sw.Stop();
+            prov.Add(new Prov { Name = name, Source = source, Status = status, Ms = sw.ElapsedMilliseconds, Reason = reason });
+            log($"{name}: {status}");
+        }
 
-        // ---------------- DEVICE ----------------
+        // ==================== DENYLIST (shown first in detail) ====================
+        Section("Data this tool never collects");
+        foreach (var d in NeverCollect) Line($"- {d}");
+        Note("These are never queried. Blanks elsewhere mean 'not detected' within a successful module, or 'not collected' where the provenance table marks a module Skipped or Failed.");
+
+        // ==================== DEVICE ====================
         Section("Device");
-        try
+        Module("Device", "CIM Win32_ComputerSystem/OperatingSystem/BIOS", () =>
         {
             var cs = QueryFirst("SELECT * FROM Win32_ComputerSystem");
             var os = QueryFirst("SELECT * FROM Win32_OperatingSystem");
             var bios = QueryFirst("SELECT * FROM Win32_BIOS");
-
             if (cs != null)
             {
                 KV("Manufacturer", cs["Manufacturer"]);
@@ -71,135 +128,130 @@ public static class Collector
             if (bios != null) KV("Serial", bios["SerialNumber"]);
             if (os != null)
             {
-                KV("OS", os["Caption"]);
+                string caption = os["Caption"]?.ToString() ?? "";
+                KV("OS", caption);
                 KV("OS version", os["Version"]);
                 KV("OS build", os["BuildNumber"]);
                 KV("Architecture", os["OSArchitecture"]);
                 KV("Installed on", ToDate(os["InstallDate"]));
                 KV("Last boot", ToDate(os["LastBootUpTime"]));
+                isHomeEdition = caption.Contains("Home", StringComparison.OrdinalIgnoreCase);
             }
             bool partOfDomain = cs != null && ToBool(cs["PartOfDomain"]);
-            if (partOfDomain) KV("Domain/Workgroup", $"Domain: {cs!["Domain"]}");
-            else KV("Domain/Workgroup", $"Workgroup: {cs?["Workgroup"]}");
+            KV("Domain/Workgroup", partOfDomain ? $"Domain: {cs!["Domain"]}" : $"Workgroup: {cs?["Workgroup"]}");
             if (!string.IsNullOrEmpty(loggedInUser)) KV("Logged-in user", loggedInUser);
-        }
-        catch (Exception ex) { Note("Device section error: " + ex.Message); }
-        log("Device collected.");
+            if (isHomeEdition)
+            {
+                KV("Edition note", "Windows Home — cannot join a domain or apply Group Policy baselines.");
+                Flag("4.1", "Windows edition", "Concern", "Home edition on a business machine; central configuration baselines cannot be applied.");
+            }
+        });
 
-        // ---------------- TIME & TIMEZONE ----------------
+        // ==================== SYSTEM TIME ====================
         Section("System time");
-        try
+        Module("System time", "OS clock", () =>
         {
             KV("Local time", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss zzz"));
             KV("UTC time", DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"));
             KV("Time zone", TimeZoneInfo.Local.DisplayName);
-        }
-        catch (Exception ex) { Note("Time section error: " + ex.Message); }
+        });
 
-        // ---------------- PATCH POSTURE ----------------
+        // ==================== PATCH POSTURE ====================
         Section("Patch posture");
-        try
+        Module("Patch history", "CIM Win32_QuickFixEngineering", () =>
         {
             var fixes = Query("SELECT * FROM Win32_QuickFixEngineering").ToList();
             if (fixes.Count > 0)
             {
-                var ordered = fixes
-                    .OrderByDescending(f => ParseDate(f["InstalledOn"]?.ToString()))
-                    .ToList();
+                var ordered = fixes.OrderByDescending(f => ParseDate(f["InstalledOn"]?.ToString())).ToList();
                 var latest = ordered[0];
-                KV("Most recent update", $"{latest["HotFixID"]} ({latest["InstalledOn"]})");
+                KV("Most recent update (registry)", $"{latest["HotFixID"]} ({latest["InstalledOn"]})");
                 KV("Total hotfixes listed", fixes.Count);
                 Line("");
                 Line("Recent updates:");
                 foreach (var h in ordered.Take(8))
                     Line($"  - {h["HotFixID"]}  {h["InstalledOn"]}  {h["Description"]}");
             }
-            else
-            {
-                Note("No hotfix history returned (common on feature-updated Windows 11; not necessarily a gap).");
-            }
-        }
-        catch (Exception ex) { Note("Patch section error: " + ex.Message); }
-        log("Patch posture collected.");
+            else Note("No hotfix history returned (common on feature-updated Windows 11).");
+        });
 
-        // ---------------- WINDOWS UPDATE CONFIG ----------------
+        Module("Last update install", "Event log System/19", () =>
+        {
+            var lastWu = NewestEventTime("System",
+                "*[System[(EventID=19) and Provider[@Name='Microsoft-Windows-WindowsUpdateClient']]]");
+            if (lastWu.HasValue)
+            {
+                KV("Last successful update install (event log)", lastWu.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                int daysSince = (int)(DateTime.Now - lastWu.Value).TotalDays;
+                if (daysSince > 35)
+                    Flag("7.3", "OS patching", "Concern", $"Last update installed {daysSince} days ago; cadence exceeds one month.");
+            }
+            else Note("No update-install events found in the log window.");
+        });
+
+        Module("Pending reboot", "Registry", () =>
+        {
+            bool pending =
+                RegKeyExists(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") ||
+                RegKeyExists(@"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") ||
+                (ReadReg(@"SYSTEM\CurrentControlSet\Control\Session Manager", "PendingFileRenameOperations") != null);
+            KV("Pending reboot", pending);
+            if (pending) Flag("7.3", "Pending reboot", "Concern", "Updates are staged but not active until restart.");
+        });
+
+        // ==================== WINDOWS UPDATE CONFIG ====================
         Section("Windows Update configuration");
-        try
+        Module("Windows Update policy", "Registry", () =>
         {
             object? au = ReadReg(@"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU", "AUOptions");
             object? noAuto = ReadReg(@"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU", "NoAutoUpdate");
             if (au != null) KV("AUOptions (policy)", $"{au} ({AuOptionText(au)})");
-            else Note("No Windows Update policy set (managed by default Windows settings).");
+            else Note("No Windows Update policy set (default Windows behavior).");
             if (noAuto != null) KV("NoAutoUpdate (policy)", noAuto);
-        }
-        catch (Exception ex) { Note("Windows Update section error: " + ex.Message); }
+        });
 
-        // ---------------- DISK ENCRYPTION ----------------
+        // ==================== DISK ENCRYPTION ====================
         Section("Disk encryption (BitLocker)");
-        if (isAdmin)
+        Module("BitLocker status", "manage-bde", () =>
         {
-            try
+            string status = RunProc("manage-bde.exe", "-status");
+            bool decrypted = status.Contains("Fully Decrypted", StringComparison.OrdinalIgnoreCase) ||
+                             status.Contains("Protection Off", StringComparison.OrdinalIgnoreCase);
+            foreach (var raw in status.Split('\n'))
             {
-                string status = RunProc("manage-bde.exe", "-status");
-                if (!string.IsNullOrWhiteSpace(status))
-                {
-                    foreach (var raw in status.Split('\n'))
-                    {
-                        var t = raw.Trim();
-                        if (t.StartsWith("Volume ", StringComparison.OrdinalIgnoreCase) ||
-                            t.StartsWith("Conversion Status", StringComparison.OrdinalIgnoreCase) ||
-                            t.StartsWith("Protection Status", StringComparison.OrdinalIgnoreCase) ||
-                            t.StartsWith("Encryption Method", StringComparison.OrdinalIgnoreCase))
-                        {
-                            Line("  " + t);
-                        }
-                    }
-                }
-                else
-                {
-                    Note("manage-bde returned nothing. BitLocker may be unavailable on this edition.");
-                }
-
-                // Recovery-key protector presence ONLY. The key value is never emitted.
-                Line("");
-                Line("Recovery protection (key value is never collected):");
-                string prot = RunProc("manage-bde.exe", "-protectors -get C:");
-                if (!string.IsNullOrWhiteSpace(prot))
-                {
-                    bool hasNumeric = false, hasTpm = false, hasPassword = false, hasExternal = false;
-                    foreach (var raw in prot.Split('\n'))
-                    {
-                        // Never emit any line that contains a recovery-key pattern.
-                        if (RecoveryKeyPattern.IsMatch(raw)) continue;
-                        var t = raw.Trim();
-                        if (t.StartsWith("Numerical Password", StringComparison.OrdinalIgnoreCase)) hasNumeric = true;
-                        if (t.StartsWith("TPM", StringComparison.OrdinalIgnoreCase)) hasTpm = true;
-                        if (t.StartsWith("Password", StringComparison.OrdinalIgnoreCase)) hasPassword = true;
-                        if (t.StartsWith("External Key", StringComparison.OrdinalIgnoreCase)) hasExternal = true;
-                    }
-                    KV("Recovery password protector present", hasNumeric);
-                    KV("TPM protector present", hasTpm);
-                    KV("Password protector present", hasPassword);
-                    KV("External key protector present", hasExternal);
-                    if (!hasNumeric)
-                        Note("No recovery-password protector found. If the disk is encrypted, a lost TPM or reset could make data unrecoverable. Verify a recovery key is escrowed.");
-                }
-                else
-                {
-                    Note("No protector information returned (volume may be unencrypted).");
-                }
+                var t = raw.Trim();
+                if (t.StartsWith("Volume ", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("Conversion Status", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("Protection Status", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("Encryption Method", StringComparison.OrdinalIgnoreCase))
+                    Line("  " + t);
             }
-            catch (Exception ex) { Note("Encryption section error: " + ex.Message); }
-        }
-        else
-        {
-            Note("UNAVAILABLE without administrator rights. Re-run elevated to capture encryption status.");
-        }
-        log("Encryption collected.");
+            if (decrypted) Flag("3.6", "Disk encryption", "Concern", "OS volume is not encrypted.");
 
-        // ---------------- TPM & SECURE BOOT ----------------
+            Line("");
+            Line("Recovery protection (key value is never collected):");
+            string protx = RunProc("manage-bde.exe", "-protectors -get C:");
+            bool hasNumeric = false, hasTpm = false, hasPassword = false, hasExternal = false;
+            foreach (var raw in protx.Split('\n'))
+            {
+                if (RecoveryKeyPattern.IsMatch(raw)) continue; // never emit key digits
+                var t = raw.Trim();
+                if (t.StartsWith("Numerical Password", StringComparison.OrdinalIgnoreCase)) hasNumeric = true;
+                if (t.StartsWith("TPM", StringComparison.OrdinalIgnoreCase)) hasTpm = true;
+                if (t.StartsWith("Password", StringComparison.OrdinalIgnoreCase)) hasPassword = true;
+                if (t.StartsWith("External Key", StringComparison.OrdinalIgnoreCase)) hasExternal = true;
+            }
+            KV("Recovery password protector present", hasNumeric);
+            KV("TPM protector present", hasTpm);
+            KV("Password protector present", hasPassword);
+            KV("External key protector present", hasExternal);
+            if (!decrypted && !hasNumeric)
+                Flag("3.6", "Recovery key", "Concern", "Encrypted volume without a recovery-password protector; data-loss risk if TPM is reset.");
+        }, requiresAdmin: true);
+
+        // ==================== TPM & SECURE BOOT ====================
         Section("TPM and Secure Boot");
-        try
+        Module("TPM", "CIM Win32_Tpm", () =>
         {
             var tpm = QueryFirst("SELECT * FROM Win32_Tpm", @"root\CIMV2\Security\MicrosoftTpm");
             if (tpm != null)
@@ -209,49 +261,85 @@ public static class Collector
                 KV("TPM activated", tpm["IsActivated_InitialValue"]);
                 KV("TPM spec version", tpm["SpecVersion"]);
             }
-            else
-            {
-                KV("TPM present", false);
-            }
-        }
-        catch { KV("TPM present", "Unknown (query failed; TPM may be absent)"); }
+            else KV("TPM present", false);
+        });
 
-        try
+        Module("Secure Boot", "Registry", () =>
         {
             object? sb2 = ReadReg(@"SYSTEM\CurrentControlSet\Control\SecureBoot\State", "UEFISecureBootEnabled");
             if (sb2 != null) KV("Secure Boot enabled", ToInt(sb2) == 1);
             else KV("Secure Boot", "State key absent (likely legacy BIOS or disabled)");
-        }
-        catch (Exception ex) { Note("Secure Boot read error: " + ex.Message); }
-        log("TPM and Secure Boot collected.");
+        });
 
-        // ---------------- WINDOWS FIREWALL ----------------
+        // ==================== FIREWALL ====================
         Section("Windows Firewall");
-        try
+        Module("Firewall profiles", "netsh advfirewall", () =>
         {
             string fw = RunProc("netsh.exe", "advfirewall show allprofiles state");
-            string currentProfile = "";
-            bool any = false;
+            string profile = "";
+            bool any = false, allOn = true;
             foreach (var raw in fw.Split('\n'))
             {
                 var t = raw.Trim();
                 if (t.EndsWith("Profile Settings:", StringComparison.OrdinalIgnoreCase))
-                    currentProfile = t.Replace(" Profile Settings:", "", StringComparison.OrdinalIgnoreCase).Trim();
+                    profile = t.Replace(" Profile Settings:", "", StringComparison.OrdinalIgnoreCase).Trim();
                 else if (t.StartsWith("State", StringComparison.OrdinalIgnoreCase))
                 {
                     var state = t.Length > 5 ? t.Substring(5).Trim() : "";
-                    KV($"{currentProfile} profile", $"State: {state}");
+                    KV($"{profile} profile", $"State: {state}");
                     any = true;
+                    if (!state.Equals("ON", StringComparison.OrdinalIgnoreCase)) allOn = false;
                 }
             }
             if (!any) Note("Firewall profile state unavailable.");
-        }
-        catch (Exception ex) { Note("Firewall section error: " + ex.Message); }
-        log("Firewall collected.");
+            else if (allOn) Flag("4.5", "Host firewall", "OK", "All firewall profiles are on.");
+            else Flag("4.5", "Host firewall", "Concern", "One or more firewall profiles are off.");
+        });
 
-        // ---------------- DEFENDER / ANTIVIRUS ----------------
+        Module("Inbound allow rules", "netsh firewall rules", () =>
+        {
+            string rules = RunProc("netsh.exe", "advfirewall firewall show rule name=all dir=in");
+            var blocks = rules.Split(new[] { "Rule Name:" }, StringSplitOptions.RemoveEmptyEntries);
+            int shown = 0, allow = 0;
+            Line("");
+            Line("Enabled inbound ALLOW rules (first 30):");
+            foreach (var b in blocks)
+            {
+                if (!Regex.IsMatch(b, @"Enabled:\s*Yes", RegexOptions.IgnoreCase)) continue;
+                if (!Regex.IsMatch(b, @"Action:\s*Allow", RegexOptions.IgnoreCase)) continue;
+                allow++;
+                if (shown < 30)
+                {
+                    string name = b.Split('\n')[0].Trim();
+                    var portM = Regex.Match(b, @"LocalPort:\s*(.+)", RegexOptions.IgnoreCase);
+                    string port = portM.Success ? portM.Groups[1].Value.Trim() : "";
+                    Line($"  - {name}  (LocalPort: {port})");
+                    shown++;
+                }
+            }
+            KV("Total enabled inbound allow rules", allow);
+        });
+
+        // ==================== RDP ====================
+        Section("Remote Desktop (RDP)");
+        Module("RDP", "Registry", () =>
+        {
+            object? deny = ReadReg(@"SYSTEM\CurrentControlSet\Control\Terminal Server", "fDenyTSConnections");
+            bool rdpEnabled = deny != null && ToInt(deny) == 0;
+            KV("RDP enabled", rdpEnabled);
+            if (rdpEnabled)
+            {
+                object? nla = ReadReg(@"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp", "UserAuthentication");
+                bool nlaOn = nla != null && ToInt(nla) == 1;
+                KV("Network Level Authentication required", nlaOn);
+                if (!nlaOn) Flag("4.6", "RDP", "Concern", "RDP is enabled without Network Level Authentication.");
+                else Flag("4.6", "RDP", "Info", "RDP is enabled with NLA required.");
+            }
+        });
+
+        // ==================== DEFENDER / AV ====================
         Section("Antivirus / Microsoft Defender");
-        try
+        Module("Defender status", "CIM MSFT_MpComputerStatus", () =>
         {
             var mp = QueryFirst("SELECT * FROM MSFT_MpComputerStatus", @"root\Microsoft\Windows\Defender");
             if (mp != null)
@@ -261,15 +349,13 @@ public static class Collector
                 KV("Signature version", mp["AntivirusSignatureVersion"]);
                 KV("Signature age (days)", mp["AntivirusSignatureAge"]);
                 KV("Tamper protection", mp["IsTamperProtected"]);
+                if (!ToBool(mp["RealTimeProtectionEnabled"]))
+                    Flag("10.1", "Real-time protection", "Concern", "Defender real-time protection is off.");
             }
-            else
-            {
-                Note("Defender status unavailable (may be replaced by third-party antivirus).");
-            }
-        }
-        catch (Exception ex) { Note("Defender section error: " + ex.Message); }
+            else Note("Defender status unavailable (may be replaced by third-party antivirus).");
+        });
 
-        try
+        Module("Registered AV products", "CIM SecurityCenter2", () =>
         {
             var avs = Query("SELECT * FROM AntiVirusProduct", @"root\SecurityCenter2").ToList();
             if (avs.Count > 0)
@@ -278,11 +364,9 @@ public static class Collector
                 Line("Registered antivirus products (Security Center):");
                 foreach (var a in avs) Line($"  - {a["displayName"]}");
             }
-        }
-        catch { /* Security Center may be unavailable on server SKUs */ }
+        });
 
-        // Defender exclusions — a common malware persistence trick.
-        try
+        Module("Defender exclusions", "CIM MSFT_MpPreference", () =>
         {
             var pref = QueryFirst("SELECT * FROM MSFT_MpPreference", @"root\Microsoft\Windows\Defender");
             if (pref != null)
@@ -293,13 +377,24 @@ public static class Collector
                 EmitArray(Line, "Extension", pref["ExclusionExtension"] as string[]);
                 EmitArray(Line, "Process", pref["ExclusionProcess"] as string[]);
             }
-        }
-        catch { /* preference class may be unavailable */ }
-        log("Antivirus collected.");
+        });
 
-        // ---------------- LOCAL ACCOUNTS ----------------
+        Module("Defender history", "Event log Defender/Operational", () =>
+        {
+            const string dfd = "Microsoft-Windows-Windows Defender/Operational";
+            int detections = CountEvents(dfd, $"*[System[(EventID=1116) and TimeCreated[timediff(@SystemTime)<={Days90}]]]");
+            var lastDetect = NewestEventTime(dfd, "*[System[(EventID=1116)]]");
+            int rtpOff = CountEvents(dfd, $"*[System[(EventID=5001) and TimeCreated[timediff(@SystemTime)<={Days90}]]]");
+            Line("");
+            KV("Defender detections (90 days)", CountText(detections));
+            KV("Last detection", lastDetect.HasValue ? lastDetect.Value.ToString("yyyy-MM-dd") : "None in window");
+            KV("Real-time-protection-disabled events (90 days)", CountText(rtpOff));
+            if (rtpOff > 0) Flag("10.1", "Protection disabled", "Concern", $"Real-time protection was turned off {rtpOff} time(s) in 90 days.");
+        });
+
+        // ==================== LOCAL ACCOUNTS ====================
         Section("Local accounts");
-        try
+        Module("Local users", "CIM Win32_UserAccount", () =>
         {
             var users = Query("SELECT * FROM Win32_UserAccount WHERE LocalAccount=True").ToList();
             if (users.Count > 0)
@@ -309,21 +404,27 @@ public static class Collector
                 {
                     string name = u["Name"]?.ToString() ?? "";
                     bool disabled = ToBool(u["Disabled"]);
+                    bool pwdExpires = ToBool(u["PasswordExpires"]);
                     string lastLogon = LastLogon(name);
-                    Line($"  - {name}  (Enabled: {!disabled}; PasswordRequired: {u["PasswordRequired"]}; Last logon: {lastLogon})");
+                    Line($"  - {name}  (Enabled: {!disabled}; PasswordRequired: {u["PasswordRequired"]}; PasswordExpires: {pwdExpires}; Last logon: {lastLogon})");
+                    if (name.Equals("Administrator", StringComparison.OrdinalIgnoreCase) && !disabled)
+                        Flag("4.7", "Default admin account", "Concern", "Built-in Administrator account is enabled and not renamed.");
+                    if (name.Equals("Guest", StringComparison.OrdinalIgnoreCase) && !disabled)
+                        Flag("4.7", "Guest account", "Concern", "Built-in Guest account is enabled.");
+                    if (!disabled && !pwdExpires)
+                        Flag("5.3", "Password expiry", "Info", $"Account '{name}' has a non-expiring password.");
                 }
             }
-        }
-        catch (Exception ex) { Note("Local users error: " + ex.Message); }
+        });
 
-        Line("");
-        try
+        Module("Administrators group", "net localgroup", () =>
         {
             string grp = RunProc("net.exe", "localgroup Administrators");
             var lines = grp.Split('\n').Select(x => x.TrimEnd('\r')).ToList();
             int dash = lines.FindIndex(x => x.StartsWith("----"));
             if (dash >= 0)
             {
+                Line("");
                 Line("Members of local Administrators group:");
                 for (int i = dash + 1; i < lines.Count; i++)
                 {
@@ -334,35 +435,25 @@ public static class Collector
                     Line($"  - {m}");
                 }
             }
-            else
-            {
-                Note("Could not enumerate the Administrators group.");
-            }
-        }
-        catch (Exception ex) { Note("Administrators group error: " + ex.Message); }
+            else Note("Could not enumerate the Administrators group.");
+        });
 
-        // Is the interactive user an administrator?
-        try
+        Module("Admin-user check", "Derived", () =>
         {
-            if (!string.IsNullOrEmpty(loggedInUser))
-            {
-                string shortName = loggedInUser.Contains('\\') ? loggedInUser.Split('\\').Last() : loggedInUser;
-                bool inAdmins = adminMembers.Any(a =>
-                    a.EndsWith("\\" + shortName, StringComparison.OrdinalIgnoreCase) ||
-                    a.Equals(shortName, StringComparison.OrdinalIgnoreCase) ||
-                    a.Equals(loggedInUser, StringComparison.OrdinalIgnoreCase));
-                Line("");
-                KV("Logged-in user is a local administrator", inAdmins);
-                if (inAdmins)
-                    Note("The account in daily use has administrator rights. This is a standing-privilege finding.");
-            }
-        }
-        catch (Exception ex) { Note("Admin-user check error: " + ex.Message); }
-        log("Local accounts collected.");
+            if (string.IsNullOrEmpty(loggedInUser)) return;
+            string shortName = loggedInUser.Contains('\\') ? loggedInUser.Split('\\').Last() : loggedInUser;
+            bool inAdmins = adminMembers.Any(a =>
+                a.EndsWith("\\" + shortName, StringComparison.OrdinalIgnoreCase) ||
+                a.Equals(shortName, StringComparison.OrdinalIgnoreCase) ||
+                a.Equals(loggedInUser, StringComparison.OrdinalIgnoreCase));
+            Line("");
+            KV("Logged-in user is a local administrator", inAdmins);
+            if (inAdmins) Flag("5.4", "Admin privilege", "Concern", "The account in daily use has local administrator rights.");
+        });
 
-        // ---------------- PASSWORD & LOCKOUT POLICY ----------------
+        // ==================== PASSWORD POLICY ====================
         Section("Password and lockout policy");
-        try
+        Module("Password policy", "net accounts", () =>
         {
             string acc = RunProc("net.exe", "accounts");
             foreach (var raw in acc.Split('\n'))
@@ -370,102 +461,123 @@ public static class Collector
                 var t = raw.TrimEnd('\r');
                 if (t.Contains(':')) Line("  " + t.Trim());
             }
-        }
-        catch (Exception ex) { Note("Password policy error: " + ex.Message); }
+            var mlM = Regex.Match(acc, @"Minimum password length[^:]*:\s*(\d+)", RegexOptions.IgnoreCase);
+            if (mlM.Success && int.TryParse(mlM.Groups[1].Value, out int ml) && ml < 14)
+                Flag("5.2", "Password length", "Concern", $"Minimum password length is {ml}; IG1 expects at least 14 (non-MFA).");
+        });
 
-        // ---------------- LOCAL SECURITY SETTINGS ----------------
+        // ==================== LOCAL SECURITY SETTINGS ====================
         Section("Local security settings");
-        try
+        Module("Local security settings", "Registry LSA/Policies", () =>
         {
-            object? lmCompat = ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "LmCompatibilityLevel");
-            KV("LM compatibility level", lmCompat ?? "Not set (default)");
-            object? restrictAnon = ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "RestrictAnonymous");
-            KV("RestrictAnonymous", restrictAnon ?? "Not set");
-            object? restrictAnonSam = ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "RestrictAnonymousSAM");
-            KV("RestrictAnonymousSAM", restrictAnonSam ?? "Not set");
+            KV("LM compatibility level", ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "LmCompatibilityLevel") ?? "Not set (default)");
+            KV("RestrictAnonymous", ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "RestrictAnonymous") ?? "Not set");
+            KV("RestrictAnonymousSAM", ReadReg(@"SYSTEM\CurrentControlSet\Control\Lsa", "RestrictAnonymousSAM") ?? "Not set");
             object? uac = ReadReg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA");
             KV("UAC enabled (EnableLUA)", uac == null ? "Not set" : (ToInt(uac) == 1).ToString());
-            object? consent = ReadReg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "ConsentPromptBehaviorAdmin");
-            KV("UAC admin prompt level", consent ?? "Not set");
+            KV("UAC admin prompt level", ReadReg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "ConsentPromptBehaviorAdmin") ?? "Not set");
             object? autorun = ReadReg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoDriveTypeAutoRun");
             KV("Autorun policy (NoDriveTypeAutoRun)", autorun ?? "Not set");
-            // Guest / Administrator rename check comes from the users list.
-        }
-        catch (Exception ex) { Note("Local security settings error: " + ex.Message); }
+            if (autorun == null || ToInt(autorun) == 0)
+                Flag("10.3", "Autorun/Autoplay", "Concern", "Autorun is not disabled by policy.");
+        });
 
-        // ---------------- SMBv1 ----------------
+        // ==================== SMBv1 ====================
         Section("SMBv1 protocol");
-        try
+        Module("SMBv1", "Registry", () =>
         {
-            object? smb1 = ReadReg(@"SYSTEM\CurrentControlSet\Services\mrxsmb10", "Start");
-            object? smb1Srv = ReadReg(@"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", "SMB1");
-            KV("SMBv1 client service start", smb1 == null ? "Unknown" : SmbStartText(smb1));
-            KV("SMBv1 server enabled", smb1Srv == null ? "Default" : (ToInt(smb1Srv) == 1).ToString());
-        }
-        catch (Exception ex) { Note("SMBv1 section error: " + ex.Message); }
+            object? clientStart = ReadReg(@"SYSTEM\CurrentControlSet\Services\mrxsmb10", "Start");
+            object? srv = ReadReg(@"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", "SMB1");
+            KV("SMBv1 client", clientStart == null ? "Not present (feature removed)" : SmbStartText(clientStart));
+            KV("SMBv1 server enabled", srv == null ? "Default (check OS feature state)" : (ToInt(srv) == 1).ToString());
+            if ((clientStart != null && ToInt(clientStart) != 4) || (srv != null && ToInt(srv) == 1))
+                Flag("4.1", "SMBv1", "Concern", "Legacy SMBv1 appears enabled; it should be disabled.");
+        });
 
-        // ---------------- SCREEN LOCK ----------------
+        // ==================== SCREEN LOCK ====================
         Section("Screen lock");
-        try
+        Module("Screen lock", "Registry policy", () =>
         {
-            // Machine policy first, then current user hive (admin's) as a fallback.
-            object? active = ReadRegAny(@"Control Panel\Desktop", "ScreenSaveActive");
-            object? timeout = ReadRegAny(@"Control Panel\Desktop", "ScreenSaveTimeOut");
-            object? secure = ReadRegAny(@"Control Panel\Desktop", "ScreenSaverIsSecure");
-            KV("Screensaver active", active ?? "Not set");
-            KV("Screensaver timeout (sec)", timeout ?? "Not set");
-            KV("Password on resume", secure ?? "Not set");
-            Note("Screen-lock values reflect the hive readable while elevated and may not equal the daily user's settings.");
-        }
-        catch (Exception ex) { Note("Screen lock error: " + ex.Message); }
+            object? inactivity = ReadReg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "InactivityTimeoutSecs");
+            KV("Machine inactivity lock (sec)", inactivity ?? "Not set");
+            KV("Screensaver timeout (sec)", ReadRegAny(@"Control Panel\Desktop", "ScreenSaveTimeOut") ?? "Not set");
+            KV("Password on resume", ReadRegAny(@"Control Panel\Desktop", "ScreenSaverIsSecure") ?? "Not set");
+            if (!(inactivity != null && ToInt(inactivity) > 0))
+                Flag("4.3", "Session lock", "Concern", "No enforced inactivity screen lock policy on this machine.");
+            Note("Per-user screensaver values reflect the elevated context; the machine inactivity policy above is authoritative.");
+        });
 
-        // ---------------- AUDIT POLICY & EVENT LOGS ----------------
+        // ==================== AUDIT POLICY & LOGS ====================
         Section("Audit policy and event logs");
-        if (isAdmin)
+        Module("Audit policy", "auditpol", () =>
         {
-            try
+            string ap = RunProc("auditpol.exe", "/get /category:*");
+            var wanted = new[] { "Logon", "Logoff", "Account Lockout", "Special Logon",
+                                 "User Account Management", "Security Group Management",
+                                 "Audit Policy Change", "Process Creation" };
+            foreach (var raw in ap.Split('\n'))
             {
-                string ap = RunProc("auditpol.exe", "/get /category:*");
-                var wanted = new[] { "Logon", "Logoff", "Account Lockout", "Special Logon",
-                                     "User Account Management", "Security Group Management",
-                                     "Audit Policy Change", "Process Creation" };
-                foreach (var raw in ap.Split('\n'))
+                var t = raw.Trim();
+                if (wanted.Any(w => t.StartsWith(w, StringComparison.OrdinalIgnoreCase)))
+                    Line("  " + Regex.Replace(t, "\\s{2,}", "  "));
+            }
+        }, requiresAdmin: true);
+
+        Module("Event log limits", "wevtutil", () =>
+        {
+            Line("");
+            Line("Event log limits:");
+            foreach (var logName in new[] { "Security", "System", "Application" })
+            {
+                string g = RunProc("wevtutil.exe", $"gl {logName}");
+                string max = "", retain = "";
+                foreach (var raw in g.Split('\n'))
                 {
                     var t = raw.Trim();
-                    if (wanted.Any(w => t.StartsWith(w, StringComparison.OrdinalIgnoreCase)))
-                        Line("  " + Regex.Replace(t, "\\s{2,}", "  "));
+                    if (t.StartsWith("maxSize", StringComparison.OrdinalIgnoreCase)) max = t;
+                    if (t.StartsWith("retention", StringComparison.OrdinalIgnoreCase)) retain = t;
                 }
+                Line($"  - {logName}: {max}; {retain}");
             }
-            catch (Exception ex) { Note("Audit policy error: " + ex.Message); }
+        }, requiresAdmin: true);
 
-            try
-            {
-                Line("");
-                Line("Event log limits:");
-                foreach (var logName in new[] { "Security", "System", "Application" })
-                {
-                    string g = RunProc("wevtutil.exe", $"gl {logName}");
-                    string max = "", retain = "";
-                    foreach (var raw in g.Split('\n'))
-                    {
-                        var t = raw.Trim();
-                        if (t.StartsWith("maxSize", StringComparison.OrdinalIgnoreCase)) max = t;
-                        if (t.StartsWith("retention", StringComparison.OrdinalIgnoreCase)) retain = t;
-                    }
-                    Line($"  - {logName}: {max}; {retain}");
-                }
-            }
-            catch (Exception ex) { Note("Event log read error: " + ex.Message); }
-        }
-        else
+        Module("Security history", "Event log Security (counts/dates)", () =>
         {
-            Note("UNAVAILABLE without administrator rights.");
-        }
-        log("Audit policy collected.");
+            Line("");
+            Line("History (counts and dates only, no event contents):");
+            var oldest = OldestEventTime("Security");
+            if (oldest.HasValue)
+            {
+                int daysBack = (int)(DateTime.Now - oldest.Value).TotalDays;
+                KV("Oldest Security-log event", $"{oldest.Value:yyyy-MM-dd} ({daysBack} days of history)");
+                if (daysBack < 30)
+                    Flag("8.3", "Log retention", "Concern", $"Security log holds only {daysBack} days; investigations beyond that are impossible.");
+            }
+            KV("Failed logons (30 days)", CountText(CountEvents("Security", $"*[System[(EventID=4625) and TimeCreated[timediff(@SystemTime)<={Days30}]]]")));
+            KV("Remote (RDP) logons type 10 (30 days)", CountText(CountEvents("Security",
+                $"*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime)<={Days30}]]] and *[EventData[Data[@Name='LogonType']='10']]")));
+            KV("Account lockouts (90 days)", CountText(CountEvents("Security", $"*[System[(EventID=4740) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Accounts created (90 days)", CountText(CountEvents("Security", $"*[System[(EventID=4720) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Accounts enabled (90 days)", CountText(CountEvents("Security", $"*[System[(EventID=4722) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Accounts deleted (90 days)", CountText(CountEvents("Security", $"*[System[(EventID=4726) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Security-group member adds (90 days)", CountText(CountEvents("Security", $"*[System[(EventID=4732) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            int cleared = CountEvents("Security", $"*[System[(EventID=1102) and TimeCreated[timediff(@SystemTime)<={Days365}]]]");
+            KV("Audit-log-cleared events (365 days)", CountText(cleared));
+            if (cleared > 0) Flag("8.1", "Log integrity", "Concern", $"Security log was cleared {cleared} time(s) in the last year.");
+        }, requiresAdmin: true);
 
-        // ---------------- LISTENING PORTS ----------------
+        Module("Reliability history", "Event log System (counts)", () =>
+        {
+            Line("");
+            Line("System reliability (counts only):");
+            KV("Unexpected shutdowns (90 days)", CountText(CountEvents("System", $"*[System[(EventID=6008) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Kernel-power unexpected (90 days)", CountText(CountEvents("System", $"*[System[(EventID=41) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+            KV("Service install events (90 days)", CountText(CountEvents("System", $"*[System[(EventID=7045) and TimeCreated[timediff(@SystemTime)<={Days90}]]]")));
+        });
+
+        // ==================== LISTENING PORTS ====================
         Section("Listening ports");
-        try
+        Module("Listening ports", "netstat -ano", () =>
         {
             string ns = RunProc("netstat.exe", "-ano");
             var seen = new List<string>();
@@ -476,45 +588,36 @@ public static class Collector
                 var parts = Regex.Split(t, "\\s+");
                 if (parts.Length >= 5)
                 {
-                    string local = parts[1];
-                    string pid = parts[4];
-                    string entry = $"  - {parts[0]}  {local}  PID {pid}  ({ProcName(pid)})";
+                    string entry = $"  - {parts[0]}  {parts[1]}  PID {parts[4]}  ({ProcName(parts[4])})";
                     if (!seen.Contains(entry)) { seen.Add(entry); Line(entry); }
                 }
             }
             if (seen.Count == 0) Note("No listening ports parsed.");
-        }
-        catch (Exception ex) { Note("Listening ports error: " + ex.Message); }
-        log("Listening ports collected.");
+        });
 
-        // ---------------- SHARED FOLDERS ----------------
+        // ==================== SHARES ====================
         Section("Shared folders");
-        try
+        Module("Shares", "CIM Win32_Share", () =>
         {
             var shares = Query("SELECT * FROM Win32_Share").ToList();
             if (shares.Count > 0)
-                foreach (var s in shares)
-                    Line($"  - {s["Name"]}  ->  {s["Path"]}  ({s["Description"]})");
-            else
-                Note("No shares enumerated.");
-        }
-        catch (Exception ex) { Note("Shares error: " + ex.Message); }
+                foreach (var s in shares) Line($"  - {s["Name"]}  ->  {s["Path"]}  ({s["Description"]})");
+            else Note("No shares enumerated.");
+        });
 
-        // ---------------- PRINTERS ----------------
+        // ==================== PRINTERS ====================
         Section("Printers and spooler");
-        try
+        Module("Printers", "CIM Win32_Printer/Service", () =>
         {
             var spooler = QueryFirst("SELECT * FROM Win32_Service WHERE Name='Spooler'");
             if (spooler != null) KV("Print Spooler service", $"State: {spooler["State"]}; StartMode: {spooler["StartMode"]}");
-            var printers = Query("SELECT * FROM Win32_Printer").ToList();
-            foreach (var p in printers)
+            foreach (var p in Query("SELECT * FROM Win32_Printer"))
                 Line($"  - {p["Name"]}  (Shared: {p["Shared"]}; Network: {p["Network"]})");
-        }
-        catch (Exception ex) { Note("Printer section error: " + ex.Message); }
+        });
 
-        // ---------------- MAPPED DRIVES ----------------
+        // ==================== MAPPED DRIVES ====================
         Section("Mapped drives");
-        try
+        Module("Mapped drives", "net use", () =>
         {
             string nu = RunProc("net.exe", "use");
             foreach (var raw in nu.Split('\n'))
@@ -523,12 +626,24 @@ public static class Collector
                 if (t.Contains(":\\") || t.Contains("\\\\")) Line("  " + t.Trim());
             }
             Note("Mapped drives are per-user; this reflects the elevated context.");
-        }
-        catch (Exception ex) { Note("Mapped drives error: " + ex.Message); }
+        });
 
-        // ---------------- SCHEDULED TASKS (NON-MICROSOFT) ----------------
+        // ==================== STARTUP PROGRAMS ====================
+        Section("Startup programs and autoruns");
+        Module("Startup programs", "Registry Run keys + Startup folder", () =>
+        {
+            EmitRun(Line, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM Run");
+            EmitRun(Line, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM RunOnce");
+            EmitRun(Line, Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKCU Run");
+            string commonStartup = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup);
+            if (Directory.Exists(commonStartup))
+                foreach (var f in Directory.GetFiles(commonStartup))
+                    Line($"  - Startup folder: {Path.GetFileName(f)}");
+        });
+
+        // ==================== SCHEDULED TASKS ====================
         Section("Scheduled tasks (non-Microsoft)");
-        try
+        Module("Scheduled tasks", "schtasks", () =>
         {
             string st = RunProc("schtasks.exe", "/query /fo csv");
             var lines = st.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
@@ -539,42 +654,32 @@ public static class Collector
                 if (l.StartsWith("\"\\Microsoft\\", StringComparison.OrdinalIgnoreCase)) continue;
                 if (!l.StartsWith("\"\\")) continue;
                 Line("  - " + l.Replace("\"", ""));
-                shown++;
-                if (shown >= 60) { Line("  - ... (list truncated)"); break; }
+                if (++shown >= 60) { Line("  - ... (truncated)"); break; }
             }
             if (shown == 0) Note("No non-Microsoft scheduled tasks found.");
-        }
-        catch (Exception ex) { Note("Scheduled tasks error: " + ex.Message); }
-        log("Tasks and shares collected.");
+        });
 
-        // ---------------- THIRD-PARTY UPDATER SERVICES ----------------
+        // ==================== UPDATER SERVICES ====================
         Section("Third-party updater services");
-        try
+        Module("Updater services", "CIM Win32_Service", () =>
         {
             string[] wanted = { "gupdate", "gupdatem", "MozillaMaintenance", "AdobeARMservice",
                                 "jusched", "Google Update", "edgeupdate", "edgeupdatem", "brave" };
-            var svcs = Query("SELECT * FROM Win32_Service").ToList();
             bool any = false;
-            foreach (var s in svcs)
+            foreach (var s in Query("SELECT * FROM Win32_Service"))
             {
                 string name = s["Name"]?.ToString() ?? "";
                 string disp = s["DisplayName"]?.ToString() ?? "";
-                if (wanted.Any(w => name.Contains(w, StringComparison.OrdinalIgnoreCase) ||
-                                    disp.Contains(w, StringComparison.OrdinalIgnoreCase)))
-                {
-                    Line($"  - {disp} [{name}]  State: {s["State"]}; StartMode: {s["StartMode"]}");
-                    any = true;
-                }
+                if (wanted.Any(w => name.Contains(w, StringComparison.OrdinalIgnoreCase) || disp.Contains(w, StringComparison.OrdinalIgnoreCase)))
+                { Line($"  - {disp} [{name}]  State: {s["State"]}; StartMode: {s["StartMode"]}"); any = true; }
             }
             if (!any) Note("No common third-party updater services found.");
-        }
-        catch (Exception ex) { Note("Updater services error: " + ex.Message); }
+        });
 
-        // ---------------- INSTALLED SOFTWARE ----------------
-        Section("Installed software");
-        try
+        // ==================== SOFTWARE ====================
+        Section("Software of interest");
+        Module("Installed software scan", "Registry Uninstall", () =>
         {
-            var appMap = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             string[] roots =
             {
                 @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -587,96 +692,91 @@ public static class Collector
                 foreach (var subName in key.GetSubKeyNames())
                 {
                     using var k = key.OpenSubKey(subName);
-                    if (k == null) continue;
-                    var name = k.GetValue("DisplayName") as string;
-                    if (string.IsNullOrWhiteSpace(name)) continue;
-                    if (appMap.ContainsKey(name)) continue;
-                    var ver = k.GetValue("DisplayVersion") as string ?? "";
-                    var pub = k.GetValue("Publisher") as string ?? "";
-                    appMap[name] = $"  - {name}  {ver}  [{pub}]";
+                    var name = k?.GetValue("DisplayName") as string;
+                    if (string.IsNullOrWhiteSpace(name) || allApps.ContainsKey(name)) continue;
+                    var ver = k?.GetValue("DisplayVersion") as string ?? "";
+                    var pub = k?.GetValue("Publisher") as string ?? "";
+                    allApps[name] = $"  - {name}  {ver}  [{pub}]";
                 }
             }
-            if (appMap.Count > 0)
+            string[] remote = { "TeamViewer", "AnyDesk", "RemotePC", "LogMeIn", "GoTo", "VNC", "Chrome Remote", "Splashtop", "ScreenConnect" };
+            string[] eol = { "Java 8", "Java 7", "Python 2", ".NET Framework 3", "Adobe Flash", "Internet Explorer" };
+            bool flagged = false;
+            foreach (var name in allApps.Keys)
             {
-                KV("Applications found", appMap.Count);
-                Line("");
-                foreach (var v in appMap.Values) Line(v);
+                if (remote.Any(rr => name.Contains(rr, StringComparison.OrdinalIgnoreCase)))
+                { Line($"  - REMOTE ACCESS: {name}"); flagged = true; Flag("4.6", "Remote-access software", "Concern", $"{name} present; provides standing remote access."); }
+                else if (eol.Any(e => name.Contains(e, StringComparison.OrdinalIgnoreCase)))
+                { Line($"  - END-OF-LIFE: {name}"); flagged = true; Flag("2.2", "Unsupported software", "Concern", $"{name} may be past vendor support."); }
             }
-            else
-            {
-                Note("No installed applications enumerated.");
-            }
-        }
-        catch (Exception ex) { Note("Installed software error: " + ex.Message); }
-        log("Installed software collected.");
+            if (!flagged) Note("No remote-access or obviously end-of-life software matched the shortlist.");
+        });
 
-        // ---------------- BROWSER EXTENSIONS ----------------
+        Section("Installed software (full inventory)");
+        Module("Full inventory render", "Derived", () =>
+        {
+            if (allApps.Count > 0)
+            {
+                KV("Applications found", allApps.Count);
+                Line("");
+                foreach (var v in allApps.Values) Line(v);
+            }
+            else Note("No installed applications enumerated.");
+        });
+
+        // ==================== BROWSER EXTENSIONS ====================
         Section("Browser extensions (all user profiles)");
-        try
+        Module("Browser extensions", "Filesystem", () =>
         {
             bool any = false;
-            string usersRoot = @"C:\Users";
+            const string usersRoot = @"C:\Users";
             if (Directory.Exists(usersRoot))
-            {
                 foreach (var userDir in Directory.GetDirectories(usersRoot))
                 {
                     any |= EmitExtensions(Line, userDir, @"AppData\Local\Google\Chrome\User Data", "Chrome");
                     any |= EmitExtensions(Line, userDir, @"AppData\Local\Microsoft\Edge\User Data", "Edge");
                 }
-            }
             if (!any) Note("No browser extensions found (or profiles not readable).");
-            Note("Extension IDs can be looked up in the Chrome/Edge web stores to identify each add-on.");
-        }
-        catch (Exception ex) { Note("Browser extensions error: " + ex.Message); }
-        log("Browser extensions collected.");
+            Note("Extension IDs can be looked up in the Chrome/Edge web stores.");
+        });
 
-        // ---------------- ROOT CERTIFICATE ANOMALIES ----------------
+        // ==================== ROOT CERT REVIEW ====================
         Section("Machine root certificate review");
-        try
+        Module("Root certificates", "X509 machine Root store", () =>
         {
             using var store = new X509Store(StoreName.Root, StoreLocation.LocalMachine);
             store.Open(OpenFlags.ReadOnly);
             int total = store.Certificates.Count;
             var flagged = new List<string>();
             foreach (var c in store.Certificates)
-            {
                 if (!IsKnownCaIssuer(c.Issuer))
                     flagged.Add($"  - {ShortName(c.Subject)}  (thumbprint {c.Thumbprint})");
-            }
             store.Close();
             KV("Root certificates in machine store", total);
             if (flagged.Count > 0)
             {
                 Line("");
-                Line("Roots not matching a common public CA (review these):");
+                Line("Roots not matching a common public CA (review):");
                 foreach (var f in flagged.Take(40)) Line(f);
-                if (flagged.Count > 40) Line("  - ... (list truncated)");
             }
-            else
-            {
-                Note("All machine roots matched common public CAs.");
-            }
-        }
-        catch (Exception ex) { Note("Certificate review error: " + ex.Message); }
-        log("Certificate review collected.");
+            else Note("All machine roots matched common public CAs.");
+        });
 
-        // ---------------- DISK VOLUMES ----------------
+        // ==================== DISK VOLUMES ====================
         Section("Disk volumes and free space");
-        try
+        Module("Disk volumes", "CIM Win32_LogicalDisk", () =>
         {
             foreach (var d in Query("SELECT * FROM Win32_LogicalDisk WHERE DriveType=3 OR DriveType=2"))
             {
-                long size = ToLong(d["Size"]);
-                long free = ToLong(d["FreeSpace"]);
+                long size = ToLong(d["Size"]); long free = ToLong(d["FreeSpace"]);
                 string type = ToInt(d["DriveType"]) == 2 ? "Removable" : "Fixed";
                 KV($"Drive {d["DeviceID"]}", $"{type}; Free {Gb(free)} of {Gb(size)}");
             }
-        }
-        catch (Exception ex) { Note("Disk volumes error: " + ex.Message); }
+        });
 
-        // ---------------- NETWORK (LOCAL ONLY) ----------------
+        // ==================== NETWORK ====================
         Section("Network configuration (this host only)");
-        try
+        Module("Network", "CIM Win32_NetworkAdapterConfiguration", () =>
         {
             foreach (var n in Query("SELECT * FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=True"))
             {
@@ -688,40 +788,80 @@ public static class Collector
                 string dnsList = dns != null ? string.Join(", ", dns) : "";
                 KV($"Interface {n["Description"]}", $"IPv4: {ip}; Gateway: {gw}; DNS: {dnsList}");
             }
-        }
-        catch (Exception ex) { Note("Network section error: " + ex.Message); }
-        Note("Only this host's own adapter configuration is read. No other hosts are contacted or scanned.");
-        log("Network collected.");
+            Note("Only this host's own adapter configuration is read. No other hosts are contacted or scanned.");
+        });
 
-        // ---------------- FOOTER ----------------
+        // ==================== COLLECTION PROVENANCE ====================
+        Section("Collection provenance");
+        Line("| Module | Source | Status | ms | Reason |");
+        Line("|--------|--------|--------|----|--------|");
+        foreach (var p in prov)
+            Line($"| {p.Name} | {p.Source} | {p.Status} | {p.Ms} | {p.Reason} |");
+        Line("");
+        Note("Success = ran and read data. Skipped = needs admin and the tool was not elevated. Failed = the module errored; the reason is recorded. A blank field inside a Success module means 'not detected'; a Skipped or Failed module means 'not collected'.");
+
+        // ==================== FOOTER ====================
         var elapsed = DateTime.Now - start;
         Section("Collection summary");
         KV("Elapsed", $"{elapsed.TotalSeconds:N1} seconds");
         KV("Elevated", isAdmin);
+        int okCount = prov.Count(p => p.Status == "Success");
+        int failCount = prov.Count(p => p.Status == "Failed");
+        int skipCount = prov.Count(p => p.Status == "Skipped");
+        KV("Modules", $"{prov.Count} total — {okCount} success, {skipCount} skipped, {failCount} failed");
         Line("");
-        Line("### What was NOT collected (by design)");
-        Line("- No documents, spreadsheets, or personal files");
-        Line("- No passwords, secrets, or credential material");
-        Line("- No BitLocker recovery key values (presence only)");
-        Line("- No email content or mailboxes");
-        Line("- No browser history, bookmarks, or saved data (extension IDs only)");
-        Line("- No keystrokes or screen contents");
-        Line("- No data from any other computer on the network");
-        Line("");
-        Line($"_Report generated by FieldDesk Collector v{Version}. Read-only. Open source (MIT)._");
+        Line("_Report generated by FieldDesk Collector v" + Version + ". Read-only. Open source (MIT)._");
 
-        // ---------------- WRITE FILE ----------------
+        // ==================== ASSEMBLE FINAL (summary first) ====================
+        var final = new StringBuilder();
+        final.AppendLine("# FieldDesk Collection Report");
+        final.AppendLine();
+        final.AppendLine($"- **Hostname:** {host}");
+        final.AppendLine($"- **Collected (local):** {start:yyyy-MM-dd HH:mm:ss zzz}");
+        final.AppendLine($"- **Collected (UTC):** {start.ToUniversalTime():yyyy-MM-dd HH:mm:ss}");
+        final.AppendLine($"- **Collector version:** {Version}");
+        final.AppendLine($"- **Run as:** {Environment.UserName}");
+        final.AppendLine($"- **Elevated (admin):** {isAdmin}");
+        final.AppendLine();
+        final.AppendLine("> Read-only. Only this one computer. Nothing changed or installed.");
+
+        var concerns = findings.Where(f => f.Status == "Concern").ToList();
+        final.AppendLine();
+        final.AppendLine("## Executive summary");
+        final.AppendLine();
+        if (concerns.Count == 0)
+            final.AppendLine("No machine-level concerns were flagged by automated checks. Interviews and documents still decide the process and training controls.");
+        else
+        {
+            final.AppendLine($"Automated checks flagged **{concerns.Count}** machine-level concern(s) on **{host}**:");
+            final.AppendLine();
+            foreach (var c in concerns)
+                final.AppendLine($"- **[CIS {c.Cis}] {c.Item}** — {c.Detail}");
+        }
+        final.AppendLine();
+        final.AppendLine("_Machine evidence only. Process, training, and provider controls are assessed by interview and document review, not by this tool._");
+
+        final.AppendLine();
+        final.AppendLine("## CIS safeguard rollup (machine-checkable items)");
+        final.AppendLine();
+        final.AppendLine("| CIS | Item | Status | Notes |");
+        final.AppendLine("|-----|------|--------|-------|");
+        foreach (var f in findings.OrderBy(x => x.Cis))
+            final.AppendLine($"| {f.Cis} | {f.Item} | {f.Status} | {f.Detail} |");
+        final.AppendLine();
+        final.AppendLine("---");
+
+        final.Append(body.ToString());
+
+        // ==================== WRITE FILE ====================
         string dir = Path.GetDirectoryName(Environment.ProcessPath) ?? Directory.GetCurrentDirectory();
         string fileName = $"FieldDesk_{Sanitize(host)}_{start:yyyyMMdd-HHmmss}.md";
         string fullPath = Path.Combine(dir, fileName);
-        try
-        {
-            File.WriteAllText(fullPath, sb.ToString(), new UTF8Encoding(true));
-        }
+        try { File.WriteAllText(fullPath, final.ToString(), new UTF8Encoding(true)); }
         catch
         {
             fullPath = Path.Combine(Directory.GetCurrentDirectory(), fileName);
-            File.WriteAllText(fullPath, sb.ToString(), new UTF8Encoding(true));
+            File.WriteAllText(fullPath, final.ToString(), new UTF8Encoding(true));
         }
         return fullPath;
     }
@@ -733,16 +873,53 @@ public static class Collector
         var scope = new ManagementScope($@"\\.\{ns}");
         scope.Connect();
         using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery(wql));
-        foreach (ManagementObject mo in searcher.Get())
-            yield return mo;
+        foreach (ManagementObject mo in searcher.Get()) yield return mo;
     }
 
     private static ManagementObject? QueryFirst(string wql, string ns = @"root\CIMV2")
     {
-        foreach (var mo in Query(wql, ns))
-            return mo;
+        foreach (var mo in Query(wql, ns)) return mo;
         return null;
     }
+
+    private static int CountEvents(string logName, string xpath, int cap = 50000)
+    {
+        try
+        {
+            var q = new EventLogQuery(logName, PathType.LogName, xpath);
+            using var reader = new EventLogReader(q);
+            int n = 0;
+            for (EventRecord? e = reader.ReadEvent(); e != null && n < cap; e = reader.ReadEvent()) { n++; e.Dispose(); }
+            return n;
+        }
+        catch { return -1; }
+    }
+
+    private static DateTime? NewestEventTime(string logName, string xpath)
+    {
+        try
+        {
+            var q = new EventLogQuery(logName, PathType.LogName, xpath) { ReverseDirection = true };
+            using var reader = new EventLogReader(q);
+            using var e = reader.ReadEvent();
+            return e?.TimeCreated;
+        }
+        catch { return null; }
+    }
+
+    private static DateTime? OldestEventTime(string logName)
+    {
+        try
+        {
+            var q = new EventLogQuery(logName, PathType.LogName, "*") { ReverseDirection = false };
+            using var reader = new EventLogReader(q);
+            using var e = reader.ReadEvent();
+            return e?.TimeCreated;
+        }
+        catch { return null; }
+    }
+
+    private static string CountText(int n) => n < 0 ? "Log unavailable" : n.ToString();
 
     private static string RunProc(string file, string args)
     {
@@ -761,10 +938,7 @@ public static class Collector
             p.WaitForExit(20000);
             return o;
         }
-        catch
-        {
-            return "";
-        }
+        catch { return ""; }
     }
 
     private static string LastLogon(string user)
@@ -785,11 +959,7 @@ public static class Collector
 
     private static string ProcName(string pid)
     {
-        try
-        {
-            if (int.TryParse(pid, out int id))
-                return Process.GetProcessById(id).ProcessName;
-        }
+        try { if (int.TryParse(pid, out int id)) return Process.GetProcessById(id).ProcessName; }
         catch { }
         return "?";
     }
@@ -798,6 +968,18 @@ public static class Collector
     {
         if (values == null || values.Length == 0) return;
         foreach (var v in values) line($"  - {label}: {v}");
+    }
+
+    private static void EmitRun(Action<string> line, RegistryKey hive, string path, string label)
+    {
+        try
+        {
+            using var k = hive.OpenSubKey(path);
+            if (k == null) return;
+            foreach (var name in k.GetValueNames())
+                line($"  - {label}: {name} = {k.GetValue(name)}");
+        }
+        catch { }
     }
 
     private static bool EmitExtensions(Action<string> line, string userDir, string relative, string browser)
@@ -833,7 +1015,7 @@ public static class Collector
             "Google Trust", "Thawte", "GeoTrust", "Symantec", "ISRG", "Let's Encrypt",
             "DST Root", "Certum", "IdenTrust", "QuoVadis", "T-Systems", "SwissSign",
             "Actalis", "Buypass", "AffirmTrust", "SecureTrust", "Network Solutions",
-            "COMODO", "AAA Certificate", "DTRUST", "D-TRUST", "SSL.com", "HARICA"
+            "COMODO", "AAA Certificate", "D-TRUST", "DTRUST", "SSL.com", "HARICA"
         };
         return known.Any(k => issuer.Contains(k, StringComparison.OrdinalIgnoreCase));
     }
@@ -846,27 +1028,23 @@ public static class Collector
 
     private static object? ReadReg(string path, string value)
     {
-        try
-        {
-            using var k = Registry.LocalMachine.OpenSubKey(path);
-            return k?.GetValue(value);
-        }
+        try { using var k = Registry.LocalMachine.OpenSubKey(path); return k?.GetValue(value); }
         catch { return null; }
     }
 
-    private static object? ReadRegAny(string path, string value)
+    private static bool RegKeyExists(string path)
     {
-        return ReadRegHive(Registry.CurrentUser, path, value)
-            ?? ReadRegHive(Registry.LocalMachine, @"SOFTWARE\Policies\Microsoft\Windows\" + path, value);
+        try { using var k = Registry.LocalMachine.OpenSubKey(path); return k != null; }
+        catch { return false; }
     }
+
+    private static object? ReadRegAny(string path, string value)
+        => ReadRegHive(Registry.CurrentUser, path, value)
+        ?? ReadRegHive(Registry.LocalMachine, @"SOFTWARE\Policies\Microsoft\Windows\" + path, value);
 
     private static object? ReadRegHive(RegistryKey hive, string path, string value)
     {
-        try
-        {
-            using var k = hive.OpenSubKey(path);
-            return k?.GetValue(value);
-        }
+        try { using var k = hive.OpenSubKey(path); return k?.GetValue(value); }
         catch { return null; }
     }
 
@@ -875,13 +1053,10 @@ public static class Collector
         try
         {
             using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
-            var p = new System.Security.Principal.WindowsPrincipal(id);
-            return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            return new System.Security.Principal.WindowsPrincipal(id)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         }
-        catch
-        {
-            return false;
-        }
+        catch { return false; }
     }
 
     private static string ToDate(object? wmiDate)
@@ -889,14 +1064,9 @@ public static class Collector
         try
         {
             if (wmiDate == null) return "";
-            return ManagementDateTimeConverter
-                .ToDateTime(wmiDate.ToString())
-                .ToString("yyyy-MM-dd HH:mm:ss");
+            return ManagementDateTimeConverter.ToDateTime(wmiDate.ToString()).ToString("yyyy-MM-dd HH:mm:ss");
         }
-        catch
-        {
-            return wmiDate?.ToString() ?? "";
-        }
+        catch { return wmiDate?.ToString() ?? ""; }
     }
 
     private static DateTime ParseDate(string? s) => DateTime.TryParse(s, out var d) ? d : DateTime.MinValue;
@@ -908,18 +1078,8 @@ public static class Collector
         return bool.TryParse(o.ToString(), out var r) && r;
     }
 
-    private static int ToInt(object? o)
-    {
-        if (o == null) return 0;
-        return int.TryParse(o.ToString(), out var r) ? r : 0;
-    }
-
-    private static long ToLong(object? o)
-    {
-        if (o == null) return 0;
-        return long.TryParse(o.ToString(), out var r) ? r : 0;
-    }
-
+    private static int ToInt(object? o) => o != null && int.TryParse(o.ToString(), out var r) ? r : 0;
+    private static long ToLong(object? o) => o != null && long.TryParse(o.ToString(), out var r) ? r : 0;
     private static string Gb(long bytes) => $"{bytes / 1024.0 / 1024.0 / 1024.0:N1} GB";
 
     private static string AuOptionText(object au) => ToInt(au) switch
@@ -933,11 +1093,7 @@ public static class Collector
 
     private static string SmbStartText(object start) => ToInt(start) switch
     {
-        0 => "Boot",
-        1 => "System",
-        2 => "Automatic",
-        3 => "Manual",
-        4 => "Disabled",
+        0 => "Boot", 1 => "System", 2 => "Automatic", 3 => "Manual", 4 => "Disabled",
         _ => start.ToString() ?? "?"
     };
 
