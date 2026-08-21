@@ -32,7 +32,7 @@ namespace FieldDeskCollector;
 /// </summary>
 public static class Collector
 {
-    private const string Version = "1.4.0";
+    private const string Version = "1.5.0";
 
     private const long Days30 = 2_592_000_000L;
     private const long Days90 = 7_776_000_000L;
@@ -54,6 +54,54 @@ public static class Collector
 
     private static readonly Regex RecoveryKeyPattern =
         new(@"\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}", RegexOptions.Compiled);
+
+    // Short label for each machine-checkable CIS v8 safeguard the tool assesses.
+    private static readonly Dictionary<string, string> CisLabels = new()
+    {
+        ["2.2"] = "Supported software",
+        ["3.6"] = "Encrypt end-user devices",
+        ["4.1"] = "Secure configuration",
+        ["4.3"] = "Automatic session lock",
+        ["4.5"] = "Host firewall",
+        ["4.6"] = "Securely manage assets",
+        ["4.7"] = "Manage default accounts",
+        ["5.1"] = "Account inventory",
+        ["5.2"] = "Unique passwords",
+        ["5.3"] = "Disable dormant accounts",
+        ["5.4"] = "Restrict admin privileges",
+        ["7.3"] = "Automated OS patching",
+        ["8.1"] = "Audit log management",
+        ["8.2"] = "Collect audit logs",
+        ["8.3"] = "Adequate log storage",
+        ["10.1"] = "Anti-malware deployed",
+        ["10.3"] = "Disable autorun/autoplay",
+        ["11.2"] = "Automated backups"
+    };
+
+    // Cross-framework pointers keyed by CIS v8 safeguard.
+    // Order per row: NIST CSF 2.0, NIST IR 7621 (topic), HIPAA Security Rule, PCI DSS v4, SOC 2 TSC.
+    // A tag points to a RELEVANT control; it is not a completed assessment of it.
+    private static readonly Dictionary<string, string[]> FrameworkMap = new()
+    {
+        ["2.2"]  = new[] { "ID.AM-08", "Protect", "164.308(a)(5)(ii)(B)", "6.3.3", "CC7.1" },
+        ["3.6"]  = new[] { "PR.DS-01", "Protect", "164.312(a)(2)(iv)", "3.5.1", "CC6.1" },
+        ["4.1"]  = new[] { "PR.PS-01", "Protect", "164.308(a)(1)", "2.2", "CC6.1" },
+        ["4.3"]  = new[] { "PR.AA-05", "Protect", "164.312(a)(2)(iii)", "8.2.8", "CC6.1" },
+        ["4.5"]  = new[] { "PR.IR-01", "Protect", "164.312(c)(1)", "1.4.1", "CC6.6" },
+        ["4.6"]  = new[] { "PR.PS-01", "Protect", "164.312(e)(1)", "2.2.7", "CC6.7" },
+        ["4.7"]  = new[] { "PR.AA-01", "Protect", "164.308(a)(4)", "2.2.2", "CC6.1" },
+        ["5.1"]  = new[] { "ID.AM-05", "Identify", "164.308(a)(4)", "8.2.1", "CC6.1" },
+        ["5.2"]  = new[] { "PR.AA-01", "Protect", "164.308(a)(5)(ii)(D)", "8.3.6", "CC6.1" },
+        ["5.3"]  = new[] { "PR.AA-01", "Protect", "164.308(a)(3)(ii)(C)", "8.2.6", "CC6.2" },
+        ["5.4"]  = new[] { "PR.AA-05", "Protect", "164.308(a)(4)", "7.2.1", "CC6.3" },
+        ["7.3"]  = new[] { "PR.PS-02", "Protect", "164.308(a)(5)(ii)(B)", "6.3.3", "CC7.1" },
+        ["8.1"]  = new[] { "PR.PS-04", "Detect", "164.312(b)", "10.2.1", "CC7.2" },
+        ["8.2"]  = new[] { "DE.CM-01", "Detect", "164.312(b)", "10.2.1", "CC7.2" },
+        ["8.3"]  = new[] { "PR.PS-04", "Detect", "164.312(b)", "10.5.1", "CC7.2" },
+        ["10.1"] = new[] { "DE.CM-01", "Detect", "164.308(a)(5)(ii)(B)", "5.2.1", "CC6.8" },
+        ["10.3"] = new[] { "PR.PS-01", "Protect", "164.308(a)(5)(ii)(B)", "5.2.2", "CC6.8" },
+        ["11.2"] = new[] { "RC.RP-01", "Recover", "164.308(a)(7)(ii)(A)", "N/A", "A1.2" }
+    };
 
     private sealed class Finding
     {
@@ -1158,6 +1206,31 @@ public static class Collector
         foreach (var f in findings.OrderBy(x => x.Cis))
             final.AppendLine($"| {f.Cis} | {f.Item} | {f.Status} | {f.Detail} |");
         final.AppendLine();
+
+        // ----- Coverage summary + cross-framework evidence map -----
+        int covered = CisLabels.Count;
+        final.AppendLine("## Framework coverage summary");
+        final.AppendLine();
+        final.AppendLine($"This machine provides evidence toward **{covered}** CIS Controls v8 (IG1) safeguards that a Windows endpoint can answer directly. Each is mapped below to NIST CSF 2.0, NIST IR 7621, HIPAA, PCI DSS v4, and SOC 2.");
+        final.AppendLine();
+        final.AppendLine("Controls this endpoint cannot answer are assessed by other means: the Microsoft 365 / Entra tenant (the 6.x MFA and access family), the network edge (4.2, 9.2, 12.1), and interviews or documents (training, offboarding, provider inventory, incident response). This report is one evidence source of three.");
+        final.AppendLine();
+        final.AppendLine("## Cross-framework evidence map");
+        final.AppendLine();
+        final.AppendLine("Status is derived from this machine's evidence. A framework tag points to a **relevant** control; it is not a completed assessment of that control.");
+        final.AppendLine();
+        final.AppendLine("| CIS v8 | Safeguard | Status | NIST CSF 2.0 | NIST IR 7621 | HIPAA | PCI DSS v4 | SOC 2 |");
+        final.AppendLine("|--------|-----------|--------|--------------|--------------|-------|-----------|-------|");
+        foreach (var cis in CisLabels.Keys.OrderBy(CisSort))
+        {
+            string label = CisLabels[cis];
+            string status = DeriveStatus(findings, cis);
+            var m = FrameworkMap.TryGetValue(cis, out var arr) ? arr : new[] { "", "", "", "", "" };
+            final.AppendLine($"| {cis} | {label} | {status} | {m[0]} | {m[1]} | {m[2]} | {m[3]} | {m[4]} |");
+        }
+        final.AppendLine();
+        final.AppendLine("_Legend: Concern = evidence shows a gap; OK = evidence shows the control met; Info = context worth review; Reviewed = checked, see detail below. 'N/A' means the framework has no direct machine-level equivalent for that safeguard._");
+        final.AppendLine();
         final.AppendLine("---");
 
         final.Append(body.ToString());
@@ -1407,6 +1480,25 @@ public static class Collector
     };
 
     private static string Sanitize(string s) => Regex.Replace(s, "[^A-Za-z0-9_-]", "_");
+
+    // Derive a per-safeguard status from all findings tagged with that CIS id.
+    private static string DeriveStatus(List<Finding> findings, string cis)
+    {
+        var hits = findings.Where(f => f.Cis == cis).ToList();
+        if (hits.Any(h => h.Status == "Concern")) return "Concern";
+        if (hits.Any(h => h.Status == "OK")) return "OK";
+        if (hits.Any(h => h.Status == "Info")) return "Info";
+        return "Reviewed";
+    }
+
+    // Sort CIS ids numerically (so 10.1 comes after 8.3, not after 1.x).
+    private static double CisSort(string cis)
+    {
+        var parts = cis.Split('.');
+        double major = parts.Length > 0 && double.TryParse(parts[0], out var mj) ? mj : 0;
+        double minor = parts.Length > 1 && double.TryParse(parts[1], out var mn) ? mn : 0;
+        return major * 100 + minor;
+    }
 
     // ---- Batch 1B: services helpers ----
     private static string ExtractExePath(string pathName)
